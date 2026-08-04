@@ -95,17 +95,52 @@ proc makeCtx(tag: string): ptr FFIContext[ThreadLib] =
   doAssert d.retCode == RET_OK
   cast[ptr FFIContext[ThreadLib]](cast[uint](parseBiggestUInt(d.text)))
 
-# The thread must be a foreign one, spawned by pthread_create. Nim's own
+# The thread must be a foreign one, spawned by the platform API directly
+# (pthread_create / CreateThread), not by Nim. Nim's own
 # `createThread` gives the new thread a GC heap on the way in, so a Nim thread
 # cannot reproduce this: it is already registered.
-{.
-  emit: """/*INCLUDESECTION*/
+when defined(windows):
+  {.
+    emit: """/*INCLUDESECTION*/
+#include <windows.h>
+"""
+  .}
+  {.
+    emit: """
+typedef int (*NimFfiEchoFn)(void*, void*, void*, const void*);
+
+typedef struct {
+  void* fn; void* ctx; void* cb; void* ud; const void* req; int ret;
+} NimFfiForeignCall;
+
+static DWORD WINAPI nimffi_foreign_thread_main(LPVOID arg) {
+  NimFfiForeignCall* c = (NimFfiForeignCall*)arg;
+  c->ret = ((NimFfiEchoFn)c->fn)(c->ctx, c->cb, c->ud, c->req);
+  return 0;
+}
+
+/* Calls `fn` on a thread Nim has never seen, and reports what it returned. */
+int nimffi_call_on_foreign_thread(
+    void* fn, void* ctx, void* cb, void* ud, const void* req) {
+  NimFfiForeignCall c;
+  HANDLE t;
+  c.fn = fn; c.ctx = ctx; c.cb = cb; c.ud = ud; c.req = req; c.ret = -1;
+  t = CreateThread(NULL, 0, nimffi_foreign_thread_main, &c, 0, NULL);
+  if (t == NULL) return -2;
+  WaitForSingleObject(t, INFINITE);
+  CloseHandle(t);
+  return c.ret;
+}
+"""
+  .}
+else:
+  {.
+    emit: """/*INCLUDESECTION*/
 #include <pthread.h>
 """
-.}
-
-{.
-  emit: """
+  .}
+  {.
+    emit: """
 typedef int (*NimFfiEchoFn)(void*, void*, void*, const void*);
 
 typedef struct {
@@ -119,7 +154,8 @@ static void* nimffi_foreign_thread_main(void* arg) {
 }
 
 /* Calls `fn` on a thread Nim has never seen, and reports what it returned. */
-int nimffi_call_on_pthread(void* fn, void* ctx, void* cb, void* ud, const void* req) {
+int nimffi_call_on_foreign_thread(
+    void* fn, void* ctx, void* cb, void* ud, const void* req) {
   NimFfiForeignCall c;
   pthread_t t;
   c.fn = fn; c.ctx = ctx; c.cb = cb; c.ud = ud; c.req = req; c.ret = -1;
@@ -128,9 +164,9 @@ int nimffi_call_on_pthread(void* fn, void* ctx, void* cb, void* ud, const void* 
   return c.ret;
 }
 """
-.}
+  .}
 
-proc nimffi_call_on_pthread(
+proc nimffi_call_on_foreign_thread(
   fn, ctx, cb, ud: pointer, req: pointer
 ): cint {.importc, nodecl.}
 
@@ -141,7 +177,7 @@ proc callOnForeignThread(
   ## re-declaring it, so this cannot drift from the generated signature. The
   ## main thread packs the request, as a C host would, leaving the wrapper's
   ## own allocation as the thing under test.
-  nimffi_call_on_pthread(
+  nimffi_call_on_foreign_thread(
     cast[pointer](ThreadedcabiEchoReqCAbiExport),
     cast[pointer](ctx),
     cast[pointer](onStringReply),
@@ -196,7 +232,7 @@ if params.len >= 2 and params[0] == ChildFlag:
 proc runChild(mode: string): tuple[code: int, output: string] =
   # Run the binary directly and keep both streams, so a child failure explains
   # itself in the checkpoint rather than just showing an exit code.
-  let cmd = quoteShell(getAppFilename()) & " " & ChildFlag & " " & mode & " 2>&1"
+  let cmd = quoteShell(getAppFilename()) & " " & ChildFlag & " " & mode
   let (outp, code) = execCmdEx(cmd)
   (code, outp)
 

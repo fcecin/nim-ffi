@@ -6,7 +6,7 @@
 ## registered that thread, so method entries allocated on an unregistered one:
 ## harmless under orc, fatal under refc, which is the leg that matters here.
 
-import std/[locks, strutils]
+import std/[locks, os, osproc, strutils]
 import unittest2
 import results
 import ffi
@@ -149,47 +149,66 @@ proc callOnForeignThread(
     cast[pointer](req),
   )
 
-suite "abi = c entry points are callable from foreign host threads":
-  test "a method call from a second thread succeeds":
-    let ctx = makeCtx("worker")
-    defer:
-      check ThreadLibFFIPool.destroyFFIContext(ctx).isOk()
+# ---------------------------------------------------------------------------
+# child mode
+#
+# The risky call is made in a child process, not here. Before the fix it
+# segfaults, and a segfault inside the test binary would kill the whole suite
+# mid-run: no summary, no message, and a failure that reads like a flaky runner
+# rather than "the guard is gone". Running it out of process turns that into an
+# ordinary assertion on an exit status, and lets the rest of the suite finish.
+# ---------------------------------------------------------------------------
 
+const ChildFlag = "--foreign-thread-child"
+
+proc childMain(mode: string): int =
+  let ctx = makeCtx(if mode == "many": "pool" else: "worker")
+  let rounds = if mode == "many": 8 else: 1
+
+  for i in 0 ..< rounds:
     var d: ReplyData
     initReplyData(d)
-    defer:
-      deinitReplyData(d)
-
     var req = packedWire(
-      ThreadedcabiEchoReq_CWire, ThreadedcabiEchoReq(text: "from another thread")
+      ThreadedcabiEchoReq_CWire,
+      ThreadedcabiEchoReq(text: (if mode == "many": "call " & $i
+        else: "once")),
     )
-    defer:
-      cwireFree(req)
 
-    check callOnForeignThread(ctx, addr req, addr d) == RET_OK
+    let rc = callOnForeignThread(ctx, addr req, addr d)
     waitReply(d)
-    check d.retCode == RET_OK
-    check d.text == "worker:from another thread"
+    let want = (if mode == "many": "pool:call " & $i else: "worker:once")
+    let good = rc == RET_OK and d.retCode == RET_OK and d.text == want
+
+    cwireFree(req)
+    deinitReplyData(d)
+    if not good:
+      return 1
+
+  if ThreadLibFFIPool.destroyFFIContext(ctx).isErr():
+    return 1
+  return 0
+
+# Must run before unittest2 takes over, and never inside the parent.
+let params = commandLineParams()
+if params.len >= 2 and params[0] == ChildFlag:
+  quit(childMain(params[1]))
+
+proc runChild(mode: string): tuple[code: int, output: string] =
+  # Run the binary directly and keep both streams, so a child failure explains
+  # itself in the checkpoint rather than just showing an exit code.
+  let cmd = quoteShell(getAppFilename()) & " " & ChildFlag & " " & mode & " 2>&1"
+  let (outp, code) = execCmdEx(cmd)
+  (code, outp)
+
+suite "abi = c entry points are callable from foreign host threads":
+  test "a method call from a second thread succeeds":
+    let (code, outp) = runChild("single")
+    checkpoint("child output: " & outp)
+    check code == 0
 
   test "repeated calls from many distinct threads all succeed":
-    ## Each fresh thread arrives unregistered, so it re-exercises the guard
-    ## instead of riding on the first thread's registration.
-    let ctx = makeCtx("pool")
-    defer:
-      check ThreadLibFFIPool.destroyFFIContext(ctx).isOk()
-
-    for i in 0 ..< 8:
-      var d: ReplyData
-      initReplyData(d)
-      defer:
-        deinitReplyData(d)
-
-      var req =
-        packedWire(ThreadedcabiEchoReq_CWire, ThreadedcabiEchoReq(text: "call " & $i))
-      defer:
-        cwireFree(req)
-
-      check callOnForeignThread(ctx, addr req, addr d) == RET_OK
-      waitReply(d)
-      check d.retCode == RET_OK
-      check d.text == "pool:call " & $i
+    ## Every fresh host thread arrives unregistered, so each one re-exercises
+    ## the guard rather than riding on the first thread's registration.
+    let (code, outp) = runChild("many")
+    checkpoint("child output: " & outp)
+    check code == 0

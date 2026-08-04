@@ -89,7 +89,8 @@ proc makeCtx(tag: string): ptr FFIContext[ThreadLib] =
   defer:
     cwireFree(wire)
 
-  doAssert not ThreadedcabiCreateCtorReqCAbiExport(addr wire, onStringReply, addr d).isNil()
+  doAssert not ThreadedcabiCreateCtorReqCAbiExport(addr wire, onStringReply, addr d)
+    .isNil()
   waitReply(d)
   doAssert d.retCode == RET_OK
   cast[ptr FFIContext[ThreadLib]](cast[uint](parseBiggestUInt(d.text)))
@@ -97,11 +98,14 @@ proc makeCtx(tag: string): ptr FFIContext[ThreadLib] =
 # The thread must be a foreign one, spawned by pthread_create. Nim's own
 # `createThread` gives the new thread a GC heap on the way in, so a Nim thread
 # cannot reproduce this: it is already registered.
-{.emit: """/*INCLUDESECTION*/
+{.
+  emit: """/*INCLUDESECTION*/
 #include <pthread.h>
-""".}
+"""
+.}
 
-{.emit: """
+{.
+  emit: """
 typedef int (*NimFfiEchoFn)(void*, void*, void*, const void*);
 
 typedef struct {
@@ -123,7 +127,8 @@ int nimffi_call_on_pthread(void* fn, void* ctx, void* cb, void* ud, const void* 
   pthread_join(t, (void*)0);
   return c.ret;
 }
-""".}
+"""
+.}
 
 proc nimffi_call_on_pthread(
   fn, ctx, cb, ud: pointer, req: pointer
@@ -179,9 +184,8 @@ suite "abi = c entry points are callable from foreign host threads":
       defer:
         deinitReplyData(d)
 
-      var req = packedWire(
-        ThreadedcabiEchoReq_CWire, ThreadedcabiEchoReq(text: "call " & $i)
-      )
+      var req =
+        packedWire(ThreadedcabiEchoReq_CWire, ThreadedcabiEchoReq(text: "call " & $i))
       defer:
         cwireFree(req)
 
